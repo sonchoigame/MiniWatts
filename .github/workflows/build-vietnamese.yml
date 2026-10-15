@@ -1,0 +1,74 @@
+name: Build MiniWatts Vietnamese
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Việt hóa và build IPA
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout bộ Việt hóa
+        uses: actions/checkout@v4
+        with:
+          path: localizer
+
+      - name: Lấy source MiniWatts gốc
+        run: |
+          git clone --depth 1 https://github.com/ResistanceTo/MiniWatts.git src
+          echo "Upstream commit: $(git -C src rev-parse HEAD)"
+
+      - name: Chọn Xcode mới nhất
+        run: |
+          newest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$newest"
+          xcodebuild -version
+          swift --version
+
+      - name: Thêm bản dịch tiếng Việt
+        run: |
+          python3 localizer/scripts/vietnamize.py src
+          rm -f src/.vi-translation-cache.json
+          python3 - <<'PY'
+          import json, pathlib
+          for p in pathlib.Path('src').rglob('Localizable.xcstrings'):
+              d=json.loads(p.read_text('utf-8'))
+              trans=[k for k,v in d.get('strings',{}).items() if v.get('shouldTranslate') is not False]
+              vi=[k for k,v in d.get('strings',{}).items() if 'vi' in v.get('localizations',{})]
+              missing=sorted(set(trans)-set(vi))
+              print(f'{p}: translatable={len(trans)} vi={len(vi)} missing={len(missing)}')
+              if missing:
+                  print('\n'.join(missing[:20]))
+                  raise SystemExit(1)
+          PY
+
+      - name: Đóng gói source Việt hóa
+        run: |
+          rm -rf src/.git
+          ditto -c -k --sequesterRsrc --keepParent src MiniWatts-Vietnamese-source.zip
+
+      - name: Build IPA unsigned
+        working-directory: src
+        run: |
+          chmod +x scripts/build-ipa.sh
+          ./scripts/build-ipa.sh
+
+      - name: Upload source Việt hóa
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniWatts-Vietnamese-source
+          path: MiniWatts-Vietnamese-source.zip
+          if-no-files-found: error
+
+      - name: Upload IPA Việt hóa
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniWatts-Vietnamese-unsigned-ipa
+          path: src/build/export/MiniWatts-unsigned.ipa
+          if-no-files-found: error
