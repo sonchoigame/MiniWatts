@@ -48,6 +48,13 @@ jobs:
                   raise SystemExit(1)
           PY
 
+      - name: Thêm màn hình VIETSUB BY NSMOD
+        run: |
+          cp localizer/overrides/MiniWattsApp.swift src/MiniWatts/MiniWattsApp.swift
+          grep -q "VIETSUB BY NSMOD" src/MiniWatts/MiniWattsApp.swift
+          grep -q "nsmodWelcomeShown" src/MiniWatts/MiniWattsApp.swift
+          echo "Đã gắn màn hình chào NSMOD chỉ hiện một lần"
+
       - name: Đóng gói source Việt hóa
         run: |
           rm -rf src/.git
