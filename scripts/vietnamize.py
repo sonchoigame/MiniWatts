@@ -7,9 +7,12 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 CACHE_FILE = ROOT / ".vi-translation-cache.json"
+CACHE_LOCK = Lock()
 
 OVERRIDES = {
     "About": "Giới thiệu",
@@ -82,7 +85,6 @@ OVERRIDES = {
     "Get ${metric} in ${unit}": "Lấy ${metric} theo ${unit}",
 }
 
-# printf / Swift interpolation / App Intent placeholders that must survive translation.
 PLACEHOLDER_RE = re.compile(r"(%(?:\d+\$)?[-+0 #]*\d*(?:\.\d+)?(?:hh|h|ll|l|L|z|t|j)?[@diuoxXfFeEgGaAcCsSp]|%%|\$\{[^}]+\})")
 
 try:
@@ -112,8 +114,10 @@ def google_translate(text: str) -> str:
         return text
     if text in OVERRIDES:
         return OVERRIDES[text]
-    if text in cache:
-        return cache[text]
+    with CACHE_LOCK:
+        cached = cache.get(text)
+    if cached is not None:
+        return cached
 
     protected, placeholders = protect(text)
     params = urllib.parse.urlencode({
@@ -125,20 +129,62 @@ def google_translate(text: str) -> str:
     })
     url = "https://translate.googleapis.com/translate_a/single?" + params
     last_error = None
-    for attempt in range(5):
+    for attempt in range(4):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=20) as r:
                 payload = json.loads(r.read().decode("utf-8"))
             translated = "".join(part[0] for part in payload[0] if part and part[0])
             translated = restore(translated, placeholders)
-            cache[text] = translated
-            time.sleep(0.08)
+            with CACHE_LOCK:
+                cache[text] = translated
             return translated
         except Exception as exc:
             last_error = exc
-            time.sleep(1.2 * (attempt + 1))
+            time.sleep(0.75 * (attempt + 1))
     raise RuntimeError(f"Không thể dịch chuỗi: {text!r}: {last_error}")
+
+
+def walk_string_units(node):
+    if isinstance(node, dict):
+        if "stringUnit" in node and isinstance(node["stringUnit"], dict) and "value" in node["stringUnit"]:
+            yield str(node["stringUnit"]["value"])
+        for value in node.values():
+            yield from walk_string_units(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from walk_string_units(value)
+
+
+def collect_needed_texts(catalogs):
+    needed = set()
+    for path in catalogs:
+        data = json.loads(path.read_text("utf-8"))
+        for key, entry in data.get("strings", {}).items():
+            if entry.get("shouldTranslate") is False:
+                continue
+            locs = entry.get("localizations", {})
+            if "vi" in locs:
+                continue
+            if "en" in locs:
+                needed.update(walk_string_units(locs["en"]))
+            else:
+                needed.add(key)
+    return sorted(t for t in needed if t.strip() and t not in OVERRIDES and t not in cache)
+
+
+def pretranslate(texts):
+    if not texts:
+        return
+    print(f"[VI] Dịch song song {len(texts)} chuỗi...")
+    done = 0
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = {pool.submit(google_translate, text): text for text in texts}
+        for future in as_completed(futures):
+            future.result()
+            done += 1
+            if done % 25 == 0 or done == len(texts):
+                print(f"[VI] Đã dịch {done}/{len(texts)}")
 
 
 def translate_node(node):
@@ -169,18 +215,10 @@ def localize_catalog(path: pathlib.Path):
         locs = entry.setdefault("localizations", {})
         if "vi" in locs:
             continue
-
-        # Prefer the explicit English localization, because Xcode sometimes rewrites
-        # positional placeholders there. Otherwise the catalog key is the source text.
         if "en" in locs:
             vi_node = translate_node(locs["en"])
         else:
-            vi_node = {
-                "stringUnit": {
-                    "state": "translated",
-                    "value": google_translate(key),
-                }
-            }
+            vi_node = {"stringUnit": {"state": "translated", "value": google_translate(key)}}
         locs["vi"] = vi_node
         count += 1
 
@@ -193,9 +231,8 @@ def main():
     catalogs = sorted(ROOT.rglob("Localizable.xcstrings"))
     if not catalogs:
         raise SystemExit("Không tìm thấy Localizable.xcstrings")
-    total = 0
-    for path in catalogs:
-        total += localize_catalog(path)
+    pretranslate(collect_needed_texts(catalogs))
+    total = sum(localize_catalog(path) for path in catalogs)
     CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n", "utf-8")
     print(f"[VI] Hoàn tất: {len(catalogs)} catalog, {total} mục tiếng Việt")
 
